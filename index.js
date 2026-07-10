@@ -59,7 +59,9 @@ const DEFAULT_TEXTS = {
   btn_balance: "💳 My Credits",
   btn_buy: "⭐ Buy Credits",
   btn_help: "ℹ️ Help",
-  ask_submission: "✍️ Send me your request as a single message and I'll pass it along.",
+  ask_submission:
+    "✍️ Send me the YouTube channel you want featured as a single message and I'll pass it along.\n\n(Changed your mind? Send /cancel — no credit will be used.)",
+  cancelled: "❌ Cancelled — no credit was used. Tap 'Submit a Lookup' whenever you're ready.",
   submission_received:
     "✅ Got it — your request has been submitted (ref #{id}).\nYou have {credits} credit(s) left.",
   no_credits:
@@ -557,6 +559,19 @@ async function sendCanned(ctx, subId) {
 // Text handler (must be registered AFTER commands). Handles conversational
 // state for both users (submission) and admin (reply).
 // ---------------------------------------------------------------------------
+// Cancel an in-progress lookup (or reply) without spending a credit.
+bot.command('cancel', async (ctx) => {
+  const st = state.get(ctx.from.id);
+  state.delete(ctx.from.id);
+  if (st && st.mode === 'awaiting_submission') {
+    return ctx.reply(t('cancelled'), mainMenu());
+  }
+  if (st && st.mode === 'admin_reply' && isAdmin(ctx)) {
+    return ctx.reply('Reply cancelled.');
+  }
+  return ctx.reply('Nothing to cancel.', mainMenu());
+});
+
 bot.on('text', async (ctx) => {
   const st = state.get(ctx.from.id);
 
@@ -568,6 +583,12 @@ bot.on('text', async (ctx) => {
 
   // User is submitting a request
   if (st && st.mode === 'awaiting_submission') {
+    // Safety net: a slash-command (e.g. /cancel, a typo, /start) should never
+    // be treated as a lookup or spend a credit.
+    if (ctx.message.text.trim().startsWith('/')) {
+      state.delete(ctx.from.id);
+      return ctx.reply(t('cancelled'), mainMenu());
+    }
     state.delete(ctx.from.id);
     const credits = await getCredits(ctx.from.id);
     if (credits <= 0) {
