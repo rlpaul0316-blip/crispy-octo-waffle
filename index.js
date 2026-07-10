@@ -60,7 +60,11 @@ const DEFAULT_TEXTS = {
   btn_buy: "⭐ Buy Credits",
   btn_help: "ℹ️ Help",
   ask_submission:
-    "✍️ Send me the YouTube channel you want featured as a single message and I'll pass it along.\n\n(Changed your mind? Send /cancel — no credit will be used.)",
+    "✍️ Send me the YouTube channel you want featured. You'll get a chance to confirm before any credit is used.",
+  confirm_prompt:
+    "You're about to submit this lookup for 1 credit:\n\n{content}\n\nConfirm?",
+  btn_confirm: "✅ Confirm (1 credit)",
+  btn_cancel: "❌ Cancel",
   cancelled: "❌ Cancelled — no credit was used. Tap 'Submit a Lookup' whenever you're ready.",
   submission_received:
     "✅ Got it — your request has been submitted (ref #{id}).\nYou have {credits} credit(s) left.",
@@ -232,6 +236,46 @@ function mainMenu() {
   ]);
 }
 
+// Deduct 1 credit, store the submission, and notify the admin.
+// Called only after the user taps Confirm.
+async function finalizeSubmission(ctx, content) {
+  const userId = ctx.from.id;
+  const credits = await getCredits(userId);
+  if (credits <= 0) {
+    await ctx.reply(t('no_credits'), mainMenu());
+    return;
+  }
+  const dec = await pool.query(
+    'UPDATE users SET credits = credits - 1 WHERE telegram_id = $1 AND credits > 0 RETURNING credits',
+    [userId]
+  );
+  if (!dec.rows.length) {
+    await ctx.reply(t('no_credits'), mainMenu());
+    return;
+  }
+  const remaining = dec.rows[0].credits;
+  const ins = await pool.query(
+    'INSERT INTO submissions(user_id, content) VALUES ($1, $2) RETURNING id',
+    [userId, content]
+  );
+  const subId = ins.rows[0].id;
+
+  await ctx.reply(t('submission_received', { id: subId, credits: remaining }), mainMenu());
+
+  await bot.telegram
+    .sendMessage(
+      ADMIN_ID,
+      `📬 New submission #${subId}\n` +
+        `From: ${userId} (@${ctx.from.username || 'none'})\n\n` +
+        `${content}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('💬 Reply', `areply:${subId}`)],
+        [Markup.button.callback('📋 Send Canned', `acanned:${subId}`)],
+      ])
+    )
+    .catch(() => {});
+}
+
 // ---------------------------------------------------------------------------
 // User flows
 // ---------------------------------------------------------------------------
@@ -250,6 +294,25 @@ bot.action('submit', async (ctx) => {
   }
   state.set(ctx.from.id, { mode: 'awaiting_submission' });
   await ctx.reply(t('ask_submission'));
+});
+
+// User tapped "Confirm" on the preview — now (and only now) spend the credit.
+bot.action('confirm_submit', async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = state.get(ctx.from.id);
+  if (!st || st.mode !== 'confirming' || !st.content) {
+    return ctx.reply('This lookup expired. Tap "Submit a Lookup" to start again.', mainMenu());
+  }
+  const content = st.content;
+  state.delete(ctx.from.id);
+  await finalizeSubmission(ctx, content);
+});
+
+// User tapped "Cancel" on the preview — discard, no credit used.
+bot.action('cancel_submit', async (ctx) => {
+  await ctx.answerCbQuery();
+  state.delete(ctx.from.id);
+  await ctx.reply(t('cancelled'), mainMenu());
 });
 
 bot.action('balance', async (ctx) => {
@@ -563,7 +626,7 @@ async function sendCanned(ctx, subId) {
 bot.command('cancel', async (ctx) => {
   const st = state.get(ctx.from.id);
   state.delete(ctx.from.id);
-  if (st && st.mode === 'awaiting_submission') {
+  if (st && (st.mode === 'awaiting_submission' || st.mode === 'confirming')) {
     return ctx.reply(t('cancelled'), mainMenu());
   }
   if (st && st.mode === 'admin_reply' && isAdmin(ctx)) {
@@ -581,49 +644,24 @@ bot.on('text', async (ctx) => {
     return deliverReply(ctx, st.submissionId, ctx.message.text);
   }
 
-  // User is submitting a request
-  if (st && st.mode === 'awaiting_submission') {
+  // User is composing a lookup. Instead of charging immediately, capture the
+  // content and show a preview with Confirm / Cancel buttons. Re-sending text
+  // simply updates the pending content.
+  if (st && (st.mode === 'awaiting_submission' || st.mode === 'confirming')) {
     // Safety net: a slash-command (e.g. /cancel, a typo, /start) should never
-    // be treated as a lookup or spend a credit.
+    // be treated as a lookup.
     if (ctx.message.text.trim().startsWith('/')) {
       state.delete(ctx.from.id);
       return ctx.reply(t('cancelled'), mainMenu());
     }
-    state.delete(ctx.from.id);
-    const credits = await getCredits(ctx.from.id);
-    if (credits <= 0) {
-      return ctx.reply(t('no_credits'), mainMenu());
-    }
-    // Deduct 1 credit and store submission
-    const dec = await pool.query(
-      'UPDATE users SET credits = credits - 1 WHERE telegram_id = $1 AND credits > 0 RETURNING credits',
-      [ctx.from.id]
+    state.set(ctx.from.id, { mode: 'confirming', content: ctx.message.text });
+    await ctx.reply(
+      t('confirm_prompt', { content: ctx.message.text }),
+      Markup.inlineKeyboard([
+        [Markup.button.callback(t('btn_confirm'), 'confirm_submit')],
+        [Markup.button.callback(t('btn_cancel'), 'cancel_submit')],
+      ])
     );
-    if (!dec.rows.length) {
-      return ctx.reply(t('no_credits'), mainMenu());
-    }
-    const remaining = dec.rows[0].credits;
-    const ins = await pool.query(
-      'INSERT INTO submissions(user_id, content) VALUES ($1, $2) RETURNING id',
-      [ctx.from.id, ctx.message.text]
-    );
-    const subId = ins.rows[0].id;
-
-    await ctx.reply(t('submission_received', { id: subId, credits: remaining }), mainMenu());
-
-    // Notify admin with action buttons
-    await bot.telegram
-      .sendMessage(
-        ADMIN_ID,
-        `📬 New submission #${subId}\n` +
-          `From: ${ctx.from.id} (@${ctx.from.username || 'none'})\n\n` +
-          `${ctx.message.text}`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('💬 Reply', `areply:${subId}`)],
-          [Markup.button.callback('📋 Send Canned', `acanned:${subId}`)],
-        ])
-      )
-      .catch(() => {});
     return;
   }
 
