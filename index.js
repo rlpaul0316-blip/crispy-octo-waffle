@@ -176,6 +176,8 @@ function t(key, params = {}) {
   for (const [k, v] of Object.entries(params)) {
     str = str.split(`{${k}}`).join(String(v));
   }
+  // Allow admins to type literal \n in /settext and have it render as a line break.
+  str = str.split('\\n').join('\n');
   return str;
 }
 
