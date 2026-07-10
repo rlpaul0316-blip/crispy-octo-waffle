@@ -1,0 +1,17 @@
+{
+  "name": "commission-bot",
+  "version": "1.0.0",
+  "description": "Editable-theme paid request/commission Telegram bot with credits and BTC/SOL/Stars payments",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "pg": "^8.11.5"
+  }
+}
