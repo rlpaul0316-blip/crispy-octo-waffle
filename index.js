@@ -18,6 +18,7 @@
  */
 
 const http = require('http');
+const crypto = require('crypto');
 const { Telegraf, Markup } = require('telegraf');
 const { Pool } = require('pg');
 
@@ -59,6 +60,7 @@ const DEFAULT_TEXTS = {
   btn_balance: "💳 My Credits",
   btn_buy: "⭐ Buy Credits",
   btn_help: "ℹ️ Help",
+  btn_reviews: "⭐ Reviews / Vouches",
   ask_submission:
     "✍️ Send me the YouTube channel you want featured. You'll get a chance to confirm before any credit is used.",
   confirm_prompt:
@@ -93,6 +95,7 @@ const DEFAULT_TEXTS = {
 const DEFAULT_SETTINGS = {
   btc_address: 'SET_YOUR_BTC_ADDRESS',
   sol_address: 'SET_YOUR_SOL_ADDRESS',
+  reviews_url: 'https://t.me/hdmivouch',
   packages: JSON.stringify([
     { credits: 1, stars: 50, btc: '0.0002', sol: '0.02', label: '1 credit' },
     { credits: 5, stars: 200, btc: '0.0008', sol: '0.08', label: '5 credits' },
@@ -232,6 +235,7 @@ function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback(t('btn_submit'), 'submit')],
     [Markup.button.callback(t('btn_balance'), 'balance'), Markup.button.callback(t('btn_buy'), 'buy')],
+    [Markup.button.url(t('btn_reviews'), setting('reviews_url'))],
     [Markup.button.callback(t('btn_help'), 'help')],
   ]);
 }
@@ -496,6 +500,20 @@ bot.command('users', async (ctx) => {
   await ctx.reply(lines.join('\n'));
 });
 
+bot.command('setreviews', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const url = ctx.message.text.replace(/^\/setreviews\s+/, '').trim();
+  if (!/^https?:\/\//i.test(url)) {
+    return ctx.reply('Usage: /setreviews https://t.me/yourchannel');
+  }
+  await pool.query(
+    'INSERT INTO settings(key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+    ['reviews_url', url]
+  );
+  await refreshCaches();
+  await ctx.reply('✅ Reviews link updated.');
+});
+
 bot.command('setaddr', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const parts = ctx.message.text.trim().split(/\s+/);
@@ -676,16 +694,58 @@ bot.on('text', async (ctx) => {
 async function main() {
   await initDb();
 
-  // Tiny HTTP server so Render Web Service keeps the process alive.
-  http
-    .createServer((req, res) => {
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('Bot is running.');
-    })
-    .listen(PORT, () => console.log(`HTTP keepalive on port ${PORT}`));
+  // Render automatically provides RENDER_EXTERNAL_URL (e.g.
+  // https://your-service.onrender.com). If present, run in WEBHOOK mode:
+  // Telegram pushes updates to us, so there is no getUpdates polling and
+  // therefore no 409 "other getUpdates request" conflict during redeploys.
+  const domain = process.env.RENDER_EXTERNAL_URL;
 
-  await bot.launch();
-  console.log('Bot launched.');
+  if (domain) {
+    // Stable, hard-to-guess path derived from the bot token.
+    const secretPath =
+      '/tg/' + crypto.createHash('sha256').update(BOT_TOKEN).digest('hex').slice(0, 32);
+
+    // Load the bot's own identity first — command handling in webhook mode
+    // relies on botInfo being present.
+    bot.botInfo = await bot.telegram.getMe();
+    console.log(`Authenticated as @${bot.botInfo.username}`);
+
+    const webhookHandler = bot.webhookCallback(secretPath);
+
+    http
+      .createServer((req, res) => {
+        const path = (req.url || '').split('?')[0];
+        if (path === secretPath) return webhookHandler(req, res);
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Bot is running.');
+      })
+      .listen(PORT, () => console.log(`Webhook server listening on port ${PORT}`));
+
+    // Point Telegram at this instance (last writer wins — keep ONE service).
+    await bot.telegram.setWebhook(`${domain}${secretPath}`, {
+      drop_pending_updates: true,
+    });
+
+    // Log Telegram's view of the webhook so problems are visible in the logs.
+    const info = await bot.telegram.getWebhookInfo();
+    console.log(
+      `Webhook status → url set: ${!!info.url}, pending: ${info.pending_update_count}` +
+        (info.last_error_message ? `, last error: ${info.last_error_message}` : '')
+    );
+    console.log(`Bot launched (webhook mode) → ${domain}${secretPath}`);
+  } else {
+    // Local/dev fallback: long polling.
+    http
+      .createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Bot is running.');
+      })
+      .listen(PORT, () => console.log(`HTTP keepalive on port ${PORT}`));
+
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+    await bot.launch({ dropPendingUpdates: true });
+    console.log('Bot launched (polling mode).');
+  }
 }
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
